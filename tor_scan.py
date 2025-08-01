@@ -10,13 +10,30 @@ import socket
 from collections import defaultdict
 
 # ─── USER INPUT ─────────────────────────────────────────────────────────────
+from urllib.parse import urlparse
+
 target = input("Enter the domain or IPv4 address to scan: ").strip()
 if not target:
     print("No target specified. Exiting.")
     exit(1)
+# Strip protocol and path
+parsed = urlparse(target if '://' in target else f'//{target}', scheme='')
+domain = parsed.netloc or parsed.path
+# Sanitize domain for filenames
+DOMAIN = domain.lower().rstrip('/')
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-DOMAIN = target
+# Legal Disclaimer: Responsibility and permission
+print("""
+[!] DISCLAIMER:
+In order to scan, attack or test weaknesses/exploits, you are acknowledging that you yourself are responsible for obtaining explicit permission from the target owner to perform any tests on their system.
+If you skip this warning, you may face legal issues. All weaknesses found must be reported to the target owner.
+""")
+if input("[*] Do you acknowledge and accept this disclaimer? (yes/no): ").strip().lower() != "yes":
+    print("Disclaimer not accepted. Exiting.")
+    exit(1)
+
+
 TOR_PROXY = "socks5h://127.0.0.1:9050"
 # Log files named by domain/IP and timestamp
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -70,7 +87,7 @@ def rotate_tor_ip():
             "sudo", "python3", "-c",
             "from stem import Signal; from stem.control import Controller; "
             "c = Controller.from_port(port=9051); c.authenticate(); "
-            "c.signal(Signal.NEWNYM); print('✅ Tor IP rotated.')" # Visual, to easily see working status
+            "c.signal(Signal.NEWNYM); print('✅ Tor IP rotated.')"
         ], check=True)
     except Exception as e:
         log(f"[-] Failed to rotate Tor IP: {e}")
