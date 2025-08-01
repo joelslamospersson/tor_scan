@@ -1,10 +1,11 @@
 # tor_scan
 Tor routation, scans an reachable webserver for weaknesses + has option to test those attacks on the network if permission yes is input.
 
-# Legal notice
+# Legal Disclaimer: Responsibility and permission
 ```
-In order to scan, attack or test weaknesses/exploits. You are acknowledging that you, and you yourself is responsible for this decission to ask the server owner for permissions to perform on their system.
-If you yourself select to skip this warning. You may face legal issues, all weaknesses found should/must be reported to the target owner.
+In order to scan, attack or test weaknesses/exploits, you are acknowledging that you yourself
+ are responsible for obtaining explicit permission from the target owner to perform any tests on their system.
+If you skip this warning, you may face legal issues. All weaknesses found must be reported to the target owner.
 ```
 
 # Tested system
@@ -62,6 +63,9 @@ source venv/bin/activate
 
 # Launch:
 ./tor_scan.py
+
+# Input target
+http:// or https://example.com
 ```
 
 # What it does
