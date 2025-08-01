@@ -12,15 +12,19 @@ from collections import defaultdict
 # ─── USER INPUT ─────────────────────────────────────────────────────────────
 from urllib.parse import urlparse
 
-target = input("Enter the domain or IPv4 address to scan: ").strip()
-if not target:
+raw_input = input("Enter the domain or IPv4 address to scan: ").strip()
+if not raw_input:
     print("No target specified. Exiting.")
     exit(1)
-# Strip protocol and path
-parsed = urlparse(target if '://' in target else f'//{target}', scheme='')
-domain = parsed.netloc or parsed.path
-# Sanitize domain for filenames
-DOMAIN = domain.lower().rstrip('/')
+
+# Normalize target: strip protocol and paths
+if raw_input.startswith("http://") or raw_input.startswith("https://"):
+    raw_input = raw_input.split("://", 1)[1]
+raw_input = raw_input.split('/', 1)[0]
+DOMAIN = raw_input.lower()
+# Derive root domain for enumeration (e.g., 'example.com' from 'sub.example.com')
+parts = DOMAIN.split('.')
+ROOT_DOMAIN = '.'.join(parts[-2:]) if len(parts) >= 2 else DOMAIN
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 # Legal Disclaimer: Responsibility and permission
@@ -76,6 +80,9 @@ def run_command(command, log_output=True):
         if log_output and result.stdout:
             log(result.stdout)
         return result.stdout
+    except FileNotFoundError:
+        log(f"[-] Command not found: {command[0]}")
+        return ""
     except subprocess.CalledProcessError as e:
         log(f"[-] Command failed: {e}")
         return ""
@@ -117,8 +124,9 @@ def sql_prompt_check():
 
 # ─── PASSIVE DNS LOOKUP ──────────────────────────────────────────────────────
 def fetch_dns_history():
-    log("[i] Fetching DNS history from HackerTarget...")
-    url = f"https://api.hackertarget.com/hostsearch/?q={DOMAIN}"
+    # Use root domain for passive DNS history
+    log(f"[i] Fetching DNS history for {ROOT_DOMAIN} from HackerTarget...")
+    url = f"https://api.hackertarget.com/hostsearch/?q={ROOT_DOMAIN}"
     try:
         r = requests.get(url, proxies={"http": TOR_PROXY, "https": TOR_PROXY}, timeout=15)
         log(r.text)
@@ -156,9 +164,10 @@ def geoip_lookup():
 
 # ─── SUBDOMAIN SCAN ──────────────────────────────────────────────────────────
 def enumerate_subdomains():
-    log("[i] Running amass enum -ip...")
+    # Enumerate subdomains for the root domain
+    log(f"[i] Running amass enum -ip on {ROOT_DOMAIN}...")
     try:
-        output = subprocess.check_output(["amass", "enum", "-d", DOMAIN, "-ip"], text=True)
+        output = subprocess.check_output(["amass", "enum", "-d", ROOT_DOMAIN, "-ip"], text=True)
         subs = []
         for line in output.splitlines():
             parts = line.split()
@@ -291,7 +300,10 @@ def run_once():
     fetch_dns_history()
     reverse_dns_lookup()
     geoip_lookup()
+    # Enumerate subdomains of the root and always include the target itself
     subs = enumerate_subdomains()
+    if DOMAIN not in subs:
+        subs.append(DOMAIN)
     if not subs:
         subs = [DOMAIN]
     for h in subs:
