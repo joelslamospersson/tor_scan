@@ -1,5 +1,16 @@
 # Defensive Exposure & Protection Validation Framework
 
+## Disclaimer & Intended Use
+
+This project is provided for **educational and defensive purposes only**.
+
+By using this software, you agree that:
+- You will **only use it on systems you own or have explicit permission to test**.
+- You will **not use it for unauthorized access, abuse, or malicious activities**.
+- You understand that **you are solely responsible for any actions taken using this software**.
+
+The authors and contributors assume **no liability** for misuse, damage, or legal consequences resulting from the use of this project.
+
 A **defensive-only**, **non-exploitative** security validation framework for **authorized testing** of servers and web applications.
 
 This tool answers one core question:
@@ -10,7 +21,7 @@ It does **not** exploit systems, inject payloads, extract data, or bypass protec
 
 ---
 
-## 🚨 Authorization Required
+## Authorization Required
 
 This tool **must only be used on systems you own or have explicit permission to test**.
 
