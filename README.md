@@ -1,98 +1,126 @@
-# tor_scan
-Tor routation, scans an reachable webserver for weaknesses + has option to test those attacks on the network if permission yes is input.
+# Defensive Exposure & Protection Validation Framework
 
-# Legal Disclaimer: Responsibility and permission
-```
-In order to scan, attack or test weaknesses/exploits, you are acknowledging that you yourself
- are responsible for obtaining explicit permission from the target owner to perform any tests on their system.
-If you skip this warning, you may face legal issues. All weaknesses found must be reported to the target owner.
-```
+A **defensive-only**, **non-exploitative** security validation framework for **authorized testing** of servers and web applications.
 
-# Tested system
-```
-This has been performed on a Ubuntu 24.04 system.
-```
+This tool answers one core question:
 
-# Setup
-```
-1. System Update & Core Packages
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y \
-    python3 python3-venv python3-pip \
-    tor torsocks \
-    nmap nikto whatweb wafw00f dirb \
-    snapd git build-essential libssl-dev libffi-dev
+> **“If this system were abused in the real world, would its defensive controls actually stop it?”**
 
-2. Install OWASP Amass
-sudo snap install amass
-or
-sudo apt install -y amass
+It does **not** exploit systems, inject payloads, extract data, or bypass protections.
 
-3. Configure & Start Tor
-1) Enable ControlPort
-Edit /etc/tor/torrc and add:
+---
 
-2) restart tor
-sudo systemctl restart tor
-sudo systemctl enable tor
+## 🚨 Authorization Required
 
-3) Verify status
-netstat -tnlp | grep 9050   # SOCKS proxy
-netstat -tnlp | grep 9051   # ControlPort
+This tool **must only be used on systems you own or have explicit permission to test**.
 
-4) Create the script and paste
-sudo nano tor_scan.py
-# Give permissions
-chmod +x tor_scan.py
+By running this tool, you confirm that:
+- You are authorized by the system owner
+- You accept full responsibility for its use
+- All findings will be responsibly disclosed and remediated
 
-5) If you want AbuseIPDB, Shodan, SecurityTrails or VirusTotal checks, edit the top of tor_scan.py and fill in:
-SHODAN_API_KEY      = "YOUR_SHODAN_KEY"
-ABUSEIPDB_API_KEY   = "YOUR_ABUSEIPDB_KEY"
-SECURITYTRAILS_API_KEY = "YOUR_SECURITYTRAILS_KEY"
-VT_API_KEY          = "YOUR_VIRUSTOTAL_KEY"
+---
 
-6. Python Virtual Environment (Recommended)
-python3 -m venv venv
-source venv/bin/activate
-pip install -U pip
-pip install stem requests
+## 🎯 What This Tool Is
 
-7) Run the scanner
-# If using venv:
-source venv/bin/activate
+✔ A **defensive security validation framework**  
+✔ A way to test **rate limiting, bans, throttling, and protections**  
+✔ A tool for **hardening systems before public exposure**  
+✔ Safe for **production use when used responsibly**
 
-# Launch:
-./tor_scan.py
+---
 
-# Input target
-http:// or https://example.com
-```
+## ❌ What This Tool Is NOT
 
-# What it does
-```
-You’ll be prompted for:
+This tool is **NOT**:
 
-    Target (domain or IPv4)
+- ❌ An exploit framework  
+- ❌ A penetration testing toolkit  
+- ❌ A payload injection tool  
+- ❌ A vulnerability exploitation scanner  
+- ❌ A DDoS / flood / stress-testing tool  
 
-    SQLi permission (yes/no)
+There is **no SQL injection, no XSS, no RCE, no fuzzing, and no bypass logic**.
 
-    Exploitation permission (yes/no)
+---
 
-Then it will:
+## 🔍 What It Does
 
-    Rotate your Tor IP
+### Network & Service Discovery
+- Resolves target IP addresses
+- Scans **all TCP ports (1–65535)** using safe TCP connect scans
+- Identifies exposed services:
+  - web
+  - authentication services
+  - databases / caches
+  - game / custom protocols
+  - unknown / high-risk services
 
-    Enumerate DNS & subdomains (+ real IPs)
+### Web Enumeration
+- Safely crawls web pages and endpoints
+- Discovers forms, APIs, static assets
+- Classifies endpoints as:
+  - authentication
+  - API
+  - expensive / DB-backed
+  - public / static
 
-    Reverse-DNS, GeoIP lookups
+### Defensive Validation (“Safe Attacks”)
+When escalation is enabled, the tool simulates **realistic abuse patterns**:
 
-    Nmap, Nikto, WhatWeb, WAFW00F, dirb scans
+- Repeated invalid login attempts (rate-limited)
+- Increased HTTP request rates (RFC-compliant)
+- Repeated TCP connections on exposed ports
 
-    Optional SQLMap + exploit scripts
+⚠️ **No exploits are performed.**
 
-    AbuseIPDB & Shodan checks
+---
 
-    Log everything to TARGET_YYYYMMDD_HHMMSS.log
+## 🧠 How Findings Work
 
-    Export structured JSON to TARGET_YYYYMMDD_HHMMSS_summary.json
-```
+A finding is marked **CRITICAL** when:
+
+> A publicly exposed service or endpoint  
+> receives abuse-like traffic  
+> **and no defensive response is observed**
+
+Defensive responses include:
+- HTTP 429 (rate limiting)
+- HTTP 403 (blocking)
+- connection resets
+- throttling
+- significant slowdowns
+
+If no defense activates → **CRITICAL**, because a real attacker could abuse it.
+
+---
+
+## 🧮 Defensive CVSS-Style Scoring
+
+CRITICAL findings receive a **defensive impact score** (0.0–10.0) based on:
+- Public exposure
+- Service criticality (auth, API, DB, etc.)
+- Absence of rate limiting or blocking
+
+⚠️ This is **not exploit CVSS** — it measures **defensive failure severity only**.
+
+---
+
+## 🧅 Tor Support (Optional & Safe)
+
+- HTTP/HTTPS traffic can be routed through Tor
+- Raw TCP scans remain direct (for accuracy)
+- Tor IP rotates **only between phases**
+- Tor is **never used to bypass blocks or bans**
+- Exit IPs are logged per phase
+
+Tor usage provides **origin variance**, not evasion.
+
+---
+
+## 🛡️ Compliance Mode
+
+Enable ultra-conservative testing:
+
+```bash
+--compliance
