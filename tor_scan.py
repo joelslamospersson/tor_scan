@@ -23,6 +23,7 @@ TOR_SOCKS_PROXY_DEFAULT = "socks5h://127.0.0.1:9050"
 TOR_CONTROL_HOST_DEFAULT = "127.0.0.1"
 TOR_CONTROL_PORT_DEFAULT = 9051
 TOR_ROTATION_COOLDOWN_S_DEFAULT = 12.0
+DEFAULT_LOG_FILE = "scan.log"
 
 COMMON_SUBDOMAIN_CANDIDATES: List[str] = [
     "www",
@@ -96,6 +97,7 @@ COMPLIANCE_ENDPOINT_RATE_CAPS: Dict[str, Dict[str, float]] = {
 COMPLIANCE_PORT_RATE_CAPS: Dict[str, Dict[str, float]] = {
     "auth service": {"max_rps": 0.05, "max_attempts": 5},
     "API": {"max_rps": 0.10, "max_attempts": 6},
+    "web": {"max_rps": 0.10, "max_attempts": 6},
     "database/cache": {"max_rps": 0.05, "max_attempts": 4},
     "game/custom protocol": {"max_rps": 0.10, "max_attempts": 6},
     "unknown/high-risk": {"max_rps": 0.05, "max_attempts": 4},
@@ -110,6 +112,7 @@ ENDPOINT_RATE_CAPS: Dict[str, Dict[str, float]] = {
 PORT_RATE_CAPS: Dict[str, Dict[str, float]] = {
     "auth service": {"max_rps": 0.25, "max_attempts": 15},
     "API": {"max_rps": 0.50, "max_attempts": 20},
+    "web": {"max_rps": 0.25, "max_attempts": 15},
     "database/cache": {"max_rps": 0.20, "max_attempts": 10},
     "game/custom protocol": {"max_rps": 0.50, "max_attempts": 20},
     "unknown/high-risk": {"max_rps": 0.20, "max_attempts": 10},
@@ -120,6 +123,112 @@ PORT_RATE_CAPS: Dict[str, Dict[str, float]] = {
 def log(msg: str) -> None:
     ts = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
     print(f"{ts} {msg}")
+
+
+def _append_human_log(path: str, line: str) -> None:
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line.rstrip("\n") + "\n")
+    except OSError:
+        return
+
+
+def _service_type_for_exposure_class(exposure_class: str) -> str:
+    c = str(exposure_class or "").lower()
+    if c == "web":
+        return "web"
+    if c == "auth service":
+        return "auth"
+    if c == "database/cache":
+        return "db"
+    if c == "game/custom protocol":
+        return "game"
+    return "unknown"
+
+
+def _result_label(dry_run: bool, defense_triggered: bool) -> str:
+    if dry_run:
+        return "DEGRADED"
+    return "PROTECTED" if defense_triggered else "NOT PROTECTED"
+
+
+def _format_ports_tested_summary(exposures: List["PortExposure"]) -> str:
+    parts: List[str] = []
+    for e in sorted(exposures, key=lambda x: (x.ip, x.port)):
+        parts.append(f"{e.port}({e.service})")
+    return "Ports tested: " + ", ".join(parts) if parts else "Ports tested: (none)"
+
+
+def _plan_port_test_suite(policy: Dict[str, Dict[str, float]], key: str, base_rate: float) -> List[Tuple[str, float, int]]:
+    caps = policy.get(key) or {}
+    max_rps = float(caps.get("max_rps", 0.2))
+    max_attempts = int(caps.get("max_attempts", 4))
+
+    pacing_attempts = min(5, max(1, (max_attempts - 1) // 2))
+    reconnect_attempts = max(0, max_attempts - 1 - pacing_attempts)
+
+    pacing_rps = min(0.2, max_rps)
+    reconnect_rps = min(max_rps, max(0.2, base_rate))
+
+    out: List[Tuple[str, float, int]] = []
+    if pacing_attempts:
+        out.append(("connection pacing", pacing_rps, pacing_attempts))
+    if reconnect_attempts:
+        out.append(("reconnect pressure", reconnect_rps, reconnect_attempts))
+    return out
+
+
+def _plan_port_validation_suite(policy: Dict[str, Dict[str, float]], key: str) -> List[Tuple[str, float, int]]:
+    caps = policy.get(key) or {}
+    max_rps = float(caps.get("max_rps", 0.2))
+    max_attempts = int(caps.get("max_attempts", 4))
+    pacing_attempts = min(6, max(1, max_attempts))
+    pacing_rps = min(0.2, max_rps)
+    return [("connection pacing", pacing_rps, pacing_attempts)]
+
+
+def _handshake_only_probe(ip: str, port: int, timeout_s: float, dry_run: bool) -> Dict[str, Any]:
+    if dry_run:
+        return {"defense_triggered": False, "defense_summary": "dry-run"}
+    errors: List[str] = []
+    elapsed: List[float] = []
+    start = time.monotonic()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout_s)
+    try:
+        s.connect((ip, port))
+        try:
+            _ = s.recv(128)
+        except OSError as e:
+            errors.append(str(e))
+    except OSError as e:
+        errors.append(str(e))
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    elapsed.append(max(0.0, time.monotonic() - start))
+    triggered, summary = observed_defense([], errors, elapsed)
+    return {"defense_triggered": triggered, "defense_summary": summary}
+
+
+def _log_line(
+    ts: str,
+    phase: str,
+    service_type: str,
+    port: int,
+    hostname: str,
+    subject: str,
+    detail: str,
+    test_name: str,
+    expected: str,
+    observed: str,
+    result_label: str,
+) -> str:
+    return (
+        f"{ts} {phase} | {service_type} | {port} | {hostname} | {subject} | {detail} | {test_name} | expected {expected} | {observed} | {result_label}"
+    )
 
 
 def _apply_rate_caps(policy: Dict[str, Dict[str, float]], key: str, desired_rps: float, desired_attempts: int) -> Tuple[float, int]:
@@ -263,12 +372,37 @@ def render_markdown_report(report: Dict[str, Any]) -> str:
     tor = report.get("tor") or {}
     caps = report.get("rate_cap_policy") or {}
     validation_graph = report.get("validation_graph") or []
+    ports_tested_summary = str(report.get("ports_tested_summary") or "")
+    port_tests = report.get("port_tests") or []
     findings = report.get("findings") or []
     exposures = report.get("port_exposures") or []
 
     lines: List[str] = []
     lines.append("# Defensive Exposure & Protection Validation Report")
     lines.append("")
+
+    if ports_tested_summary:
+        lines.append("## Ports tested")
+        lines.append(ports_tested_summary)
+        lines.append("")
+        pt_rows: List[List[str]] = []
+        for t in port_tests:
+            pt_rows.append(
+                [
+                    str(t.get("ip")),
+                    str(t.get("port")),
+                    str(t.get("service")),
+                    "yes" if t.get("tested") else "no",
+                    ", ".join(t.get("tests_ran") or []),
+                    "yes" if t.get("protection_triggered") else "no",
+                    str(t.get("result") or ""),
+                ]
+            )
+        if pt_rows:
+            lines.append(_as_markdown_table(["IP", "Port", "Service", "Tested", "Tests", "Protection", "Result"], pt_rows))
+        else:
+            lines.append("No port tests recorded.")
+        lines.append("")
     lines.append(f"**Target:** `{target}`")
     lines.append(f"**Timestamp:** `{ts}`")
     lines.append("")
@@ -877,6 +1011,7 @@ if __name__ == "__main__":
     parser.add_argument("--tor-control-password", default=os.environ.get("TOR_CONTROL_PASSWORD"))
     parser.add_argument("--tor-rotation-cooldown", type=float, default=TOR_ROTATION_COOLDOWN_S_DEFAULT)
     parser.add_argument("--tor-timeout", type=float, default=15.0)
+    parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
     args = parser.parse_args()
 
     target = normalize_target(args.target)
@@ -912,6 +1047,7 @@ You must have explicit permission from the system owner.
     port_caps = COMPLIANCE_PORT_RATE_CAPS if args.compliance else PORT_RATE_CAPS
 
     session = _build_http_session(use_tor=args.tor, tor_proxy_url=args.tor_proxy)
+    log_file_path = str(args.log_file)
     tor_phase_exit_ip: Dict[str, Optional[str]] = {"discovery": None, "validation": None, "escalation": None}
     tor_rotation_events: List[Dict[str, Any]] = []
 
@@ -1007,6 +1143,8 @@ You must have explicit permission from the system owner.
     endpoints: List[WebEndpoint] = []
     findings: List[Dict[str, Any]] = []
 
+    port_tests: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
     exposure_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
     base_url_meta: Dict[str, Dict[str, Any]] = {}
 
@@ -1030,6 +1168,24 @@ You must have explicit permission from the system owner.
         )
         exposures.extend(ip_exposures)
         log(f"[+] Open TCP ports on {ip}: {len(ip_exposures)}")
+
+        for e in ip_exposures:
+            _append_human_log(
+                log_file_path,
+                _log_line(
+                    datetime.now().strftime("[%Y-%m-%d %H:%M:%S]"),
+                    "discovery",
+                    _service_type_for_exposure_class(e.exposure_class),
+                    int(e.port),
+                    str(ctx.get("hostname")),
+                    str(e.ip),
+                    str(e.service),
+                    "port discovered",
+                    "n/a",
+                    "open",
+                    "DEGRADED",
+                ),
+            )
 
         for e in ip_exposures:
             exposure_meta[(e.ip, e.port)] = dict(ctx)
@@ -1068,6 +1224,94 @@ You must have explicit permission from the system owner.
     web_exposures = [e for e in exposures if e.exposure_class == "web"]
     base_url_ports: Dict[str, int] = {}
     log("[phase] validation")
+
+    ports_tested_summary = _format_ports_tested_summary(exposures)
+    if ports_tested_summary:
+        _append_human_log(
+            log_file_path,
+            f"{datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')} validation | summary | - | {primary_hostname or target} | {ports_tested_summary}",
+        )
+
+    for e in exposures:
+        meta = exposure_meta.get((e.ip, e.port)) or ip_scan_context.get(e.ip) or {"hostname": target, "ip": e.ip, "cdn_detected": False, "fallback_http_used": False, "origin_ip": False, "bypasses_cdn": False}
+        service_type = _service_type_for_exposure_class(e.exposure_class)
+        suite_key = e.exposure_class if e.exposure_class in port_caps else "unknown/high-risk"
+        plan = _plan_port_validation_suite(port_caps, suite_key)
+
+        tests_ran: List[str] = []
+        protection_triggered_any = False
+
+        handshake_result = _handshake_only_probe(e.ip, e.port, timeout_s=max(0.2, args.port_timeout), dry_run=args.dry_run)
+        tests_ran.append("handshake")
+        protection_triggered_any = protection_triggered_any or bool(handshake_result.get("defense_triggered"))
+        expected_port = "connection throttling, temporary blocks, or forced disconnects"
+
+        _append_human_log(
+            log_file_path,
+            _log_line(
+                datetime.now().strftime("[%Y-%m-%d %H:%M:%S]"),
+                "validation",
+                service_type,
+                int(e.port),
+                str(meta.get("hostname")),
+                str(e.ip),
+                str(e.service),
+                "handshake-only",
+                expected_port,
+                str(handshake_result.get("defense_summary")),
+                _result_label(args.dry_run, bool(handshake_result.get("defense_triggered"))),
+            ),
+        )
+
+        for test_name, desired_rps, desired_attempts in plan:
+            eff_rps, eff_attempts = _apply_rate_caps(port_caps, suite_key, desired_rps, desired_attempts)
+            _assert_within_caps(port_caps, suite_key, eff_rps, eff_attempts)
+            result = validate_port_protection(
+                ip=e.ip,
+                port=e.port,
+                attempts=eff_attempts,
+                rps=eff_rps,
+                timeout_s=max(0.2, args.port_timeout),
+                dry_run=args.dry_run,
+                stop_on_trigger=args.stop_on_trigger,
+            )
+            tests_ran.append(test_name)
+            protection_triggered_any = protection_triggered_any or bool(result.get("defense_triggered"))
+
+            _append_human_log(
+                log_file_path,
+                _log_line(
+                    datetime.now().strftime("[%Y-%m-%d %H:%M:%S]"),
+                    "validation",
+                    service_type,
+                    int(e.port),
+                    str(meta.get("hostname")),
+                    str(e.ip),
+                    str(e.service),
+                    test_name,
+                    expected_port,
+                    str(result.get("defense_summary")),
+                    _result_label(args.dry_run, bool(result.get("defense_triggered"))),
+                ),
+            )
+
+            if (not args.dry_run) and bool(result.get("defense_triggered")):
+                protection_triggered_global = True
+                if args.stop_on_trigger:
+                    break
+
+        port_tests[(e.ip, e.port)] = {
+            "ip": e.ip,
+            "port": e.port,
+            "service": e.service,
+            "tested": True,
+            "tests_ran": tests_ran,
+            "protection_triggered": protection_triggered_any,
+            "result": _result_label(args.dry_run, protection_triggered_any),
+        }
+
+        if protection_triggered_global and args.stop_on_trigger:
+            break
 
     web_exposures_primary = [e for e in web_exposures if e.ip in primary_v4]
     cdn_detected_primary = bool(primary_hostname and hostname_cdn_detected.get(primary_hostname, False))
@@ -1266,6 +1510,110 @@ You must have explicit permission from the system owner.
             )
 
         log("[phase] escalation")
+
+        for e in exposures:
+            meta = exposure_meta.get((e.ip, e.port)) or ip_scan_context.get(e.ip) or {"hostname": target, "ip": e.ip, "cdn_detected": False, "fallback_http_used": False, "origin_ip": False, "bypasses_cdn": False}
+            service_type = _service_type_for_exposure_class(e.exposure_class)
+            suite_key = e.exposure_class
+            if suite_key not in port_caps:
+                suite_key = "unknown/high-risk"
+
+            plan = _plan_port_test_suite(port_caps, suite_key, args.rate)
+            plan = [(n, r, a) for (n, r, a) in plan if n == "reconnect pressure"]
+            if not plan:
+                continue
+
+            tests_ran: List[str] = []
+            protection_triggered_any = False
+            per_test_summaries: List[str] = []
+            expected_port = "connection throttling, temporary blocks, or forced disconnects"
+
+            for test_name, desired_rps, desired_attempts in plan:
+                eff_rps, eff_attempts = _apply_rate_caps(port_caps, suite_key, desired_rps, desired_attempts)
+                _assert_within_caps(port_caps, suite_key, eff_rps, eff_attempts)
+                result = validate_port_protection(
+                    ip=e.ip,
+                    port=e.port,
+                    attempts=eff_attempts,
+                    rps=eff_rps,
+                    timeout_s=max(0.2, args.port_timeout),
+                    dry_run=args.dry_run,
+                    stop_on_trigger=args.stop_on_trigger,
+                )
+                tests_ran.append(test_name)
+                protection_triggered_any = protection_triggered_any or bool(result.get("defense_triggered"))
+
+                per_test_summaries.append(f"{test_name}={result.get('defense_summary')}")
+                observed = str(result.get("defense_summary"))
+                if (not args.dry_run) and (not result.get("defense_triggered")):
+                    observed = f"{observed}; Abuse path demonstrated safely"
+
+                _append_human_log(
+                    log_file_path,
+                    _log_line(
+                        datetime.now().strftime("[%Y-%m-%d %H:%M:%S]"),
+                        "escalation",
+                        service_type,
+                        int(e.port),
+                        str(meta.get("hostname")),
+                        str(e.ip),
+                        str(e.service),
+                        test_name,
+                        expected_port,
+                        observed,
+                        _result_label(args.dry_run, bool(result.get("defense_triggered"))),
+                    ),
+                )
+
+                if (not args.dry_run) and bool(result.get("defense_triggered")):
+                    protection_triggered_global = True
+                    if args.stop_on_trigger:
+                        break
+
+            existing = port_tests.get((e.ip, e.port))
+            merged_tests = list((existing or {}).get("tests_ran") or []) + tests_ran
+            port_tests[(e.ip, e.port)] = {
+                "ip": e.ip,
+                "port": e.port,
+                "service": e.service,
+                "tested": True,
+                "tests_ran": merged_tests,
+                "protection_triggered": bool((existing or {}).get("protection_triggered")) or protection_triggered_any,
+                "result": _result_label(args.dry_run, bool((existing or {}).get("protection_triggered")) or protection_triggered_any),
+            }
+
+            expected = expected_port
+            observed = "; ".join(per_test_summaries)
+            severity = "INFO" if args.dry_run else "WARN"
+            if (not args.dry_run) and (not protection_triggered_any):
+                severity = "CRITICAL"
+                observed = f"{observed}; Abuse path demonstrated safely"
+
+            findings.append(
+                {
+                    "service_or_endpoint": f"{e.ip}:{e.port} ({e.service})",
+                    "port": e.port,
+                    "exposure_class": e.exposure_class,
+                    "endpoint_class": None,
+                    "hostname": str(meta.get("hostname")),
+                    "hostname_used": str(meta.get("hostname")),
+                    "ip": meta.get("ip"),
+                    "cdn_detected": bool(meta.get("cdn_detected")),
+                    "fallback_http_used": bool(meta.get("fallback_http_used")),
+                    "origin_ip": bool(meta.get("origin_ip")),
+                    "bypasses_cdn": bool(meta.get("bypasses_cdn")),
+                    "test_performed": ", ".join(tests_ran),
+                    "expected_defense": expected,
+                    "observed_behavior": observed,
+                    "severity": severity,
+                    "effective_rps": None,
+                    "effective_attempts": None,
+                }
+            )
+
+            if protection_triggered_global and args.stop_on_trigger:
+                break
+
         for ep in endpoints:
             expected = "rate limiting (HTTP 429), blocking (HTTP 403), or throttling"
             port_for_ep = base_url_ports.get(ep.base_url)
@@ -1314,7 +1662,7 @@ You must have explicit permission from the system owner.
 
             if (not args.dry_run) and (not result["defense_triggered"]):
                 severity = "CRITICAL"
-                observed = result["defense_summary"]
+                observed = f"{result['defense_summary']}; Abuse path demonstrated safely"
             else:
                 severity = "INFO" if args.dry_run else "WARN"
                 observed = result["defense_summary"]
@@ -1341,61 +1689,39 @@ You must have explicit permission from the system owner.
                 }
             )
 
-            if (not args.dry_run) and result.get("defense_triggered"):
-                protection_triggered_global = True
-                if args.stop_on_trigger:
-                    break
-
-    if escalation_enabled and (not protection_triggered_global or not args.stop_on_trigger):
-        for e in [x for x in exposures if x.exposure_class != "web"]:
-            meta = exposure_meta.get((e.ip, e.port)) or ip_scan_context.get(e.ip) or {"hostname": target, "ip": e.ip, "cdn_detected": False, "fallback_http_used": False, "origin_ip": False, "bypasses_cdn": False}
-            expected = "connection throttling, temporary blocks, or forced disconnects"
-            desired_rps = max(0.5, args.rate)
-            desired_attempts = 30
-            eff_rps, eff_attempts = _apply_rate_caps(port_caps, e.exposure_class, desired_rps, desired_attempts)
-            _assert_within_caps(port_caps, e.exposure_class, eff_rps, eff_attempts)
-            result = validate_port_protection(
-                ip=e.ip,
-                port=e.port,
-                attempts=eff_attempts,
-                rps=eff_rps,
-                timeout_s=max(0.2, args.port_timeout),
-                dry_run=args.dry_run,
-                stop_on_trigger=args.stop_on_trigger,
-            )
-            if (not args.dry_run) and (not result["defense_triggered"]):
-                severity = "CRITICAL"
-                observed = result["defense_summary"]
-            else:
-                severity = "INFO" if args.dry_run else "WARN"
-                observed = result["defense_summary"]
-
-            findings.append(
-                {
-                    "service_or_endpoint": f"{e.ip}:{e.port} ({e.service})",
-                    "port": e.port,
-                    "exposure_class": e.exposure_class,
-                    "endpoint_class": None,
-                    "hostname": str(meta.get("hostname")),
-                    "hostname_used": str(meta.get("hostname")),
-                    "ip": meta.get("ip"),
-                    "cdn_detected": bool(meta.get("cdn_detected")),
-                    "fallback_http_used": bool(meta.get("fallback_http_used")),
-                    "origin_ip": bool(meta.get("origin_ip")),
-                    "bypasses_cdn": bool(meta.get("bypasses_cdn")),
-                    "test_performed": "repeated TCP connections",
-                    "expected_defense": expected,
-                    "observed_behavior": observed,
-                    "severity": severity,
-                    "effective_rps": eff_rps if not args.dry_run else None,
-                    "effective_attempts": result.get("attempts"),
-                }
+            _append_human_log(
+                log_file_path,
+                _log_line(
+                    datetime.now().strftime("[%Y-%m-%d %H:%M:%S]"),
+                    "escalation",
+                    "web",
+                    int(port_for_ep),
+                    str(meta.get("hostname")),
+                    str(urlsplit(ep.url).path or "/"),
+                    str(ep.endpoint_class),
+                    test,
+                    expected,
+                    observed,
+                    _result_label(args.dry_run, bool(result.get("defense_triggered"))),
+                ),
             )
 
             if (not args.dry_run) and result.get("defense_triggered"):
                 protection_triggered_global = True
                 if args.stop_on_trigger:
                     break
+
+    for e in exposures:
+        if (e.ip, e.port) not in port_tests:
+            port_tests[(e.ip, e.port)] = {
+                "ip": e.ip,
+                "port": e.port,
+                "service": e.service,
+                "tested": bool(escalation_enabled),
+                "tests_ran": [],
+                "protection_triggered": False,
+                "result": "DEGRADED" if args.dry_run else ("" if escalation_enabled else ""),
+            }
 
     for f in findings:
         if f.get("severity") == "CRITICAL":
@@ -1441,6 +1767,8 @@ You must have explicit permission from the system owner.
             "port_caps": port_caps,
             "note": "Caps are conservative maximums and override higher user-provided rates/attempts.",
         },
+        "ports_tested_summary": _format_ports_tested_summary(exposures),
+        "port_tests": [port_tests[k] for k in sorted(port_tests.keys())],
         "port_exposures": [
             {
                 "ip": e.ip,
