@@ -24,6 +24,69 @@ TOR_CONTROL_HOST_DEFAULT = "127.0.0.1"
 TOR_CONTROL_PORT_DEFAULT = 9051
 TOR_ROTATION_COOLDOWN_S_DEFAULT = 12.0
 
+COMMON_SUBDOMAIN_CANDIDATES: List[str] = [
+    "www",
+    "api",
+    "dev",
+    "admin",
+    "panel",
+    "origin",
+    "internal",
+]
+
+CDN_IPV4_RANGES: Dict[str, List[ipaddress.IPv4Network]] = {
+    "cloudflare": [
+        ipaddress.ip_network("173.245.48.0/20"),
+        ipaddress.ip_network("103.21.244.0/22"),
+        ipaddress.ip_network("103.22.200.0/22"),
+        ipaddress.ip_network("103.31.4.0/22"),
+        ipaddress.ip_network("141.101.64.0/18"),
+        ipaddress.ip_network("108.162.192.0/18"),
+        ipaddress.ip_network("190.93.240.0/20"),
+        ipaddress.ip_network("188.114.96.0/20"),
+        ipaddress.ip_network("197.234.240.0/22"),
+        ipaddress.ip_network("198.41.128.0/17"),
+        ipaddress.ip_network("162.158.0.0/15"),
+        ipaddress.ip_network("104.16.0.0/13"),
+        ipaddress.ip_network("104.24.0.0/14"),
+        ipaddress.ip_network("172.64.0.0/13"),
+        ipaddress.ip_network("131.0.72.0/22"),
+    ],
+    "fastly": [
+        ipaddress.ip_network("151.101.0.0/16"),
+        ipaddress.ip_network("199.232.0.0/16"),
+        ipaddress.ip_network("23.235.32.0/20"),
+        ipaddress.ip_network("43.249.72.0/22"),
+        ipaddress.ip_network("103.244.50.0/24"),
+        ipaddress.ip_network("103.245.222.0/23"),
+        ipaddress.ip_network("103.245.224.0/24"),
+        ipaddress.ip_network("104.156.80.0/20"),
+        ipaddress.ip_network("146.75.0.0/16"),
+    ],
+    "cloudfront": [
+        ipaddress.ip_network("13.32.0.0/15"),
+        ipaddress.ip_network("13.35.0.0/16"),
+        ipaddress.ip_network("52.46.0.0/18"),
+        ipaddress.ip_network("52.84.0.0/15"),
+        ipaddress.ip_network("52.124.128.0/17"),
+        ipaddress.ip_network("54.182.0.0/16"),
+        ipaddress.ip_network("54.192.0.0/16"),
+        ipaddress.ip_network("54.230.0.0/16"),
+        ipaddress.ip_network("54.239.128.0/18"),
+        ipaddress.ip_network("99.84.0.0/16"),
+        ipaddress.ip_network("108.138.0.0/15"),
+        ipaddress.ip_network("143.204.0.0/16"),
+        ipaddress.ip_network("204.246.164.0/22"),
+        ipaddress.ip_network("204.246.168.0/22"),
+        ipaddress.ip_network("204.246.174.0/23"),
+        ipaddress.ip_network("204.246.176.0/20"),
+        ipaddress.ip_network("205.251.192.0/19"),
+        ipaddress.ip_network("205.251.249.0/24"),
+        ipaddress.ip_network("205.251.250.0/23"),
+        ipaddress.ip_network("205.251.252.0/23"),
+    ],
+}
+
 COMPLIANCE_ENDPOINT_RATE_CAPS: Dict[str, Dict[str, float]] = {
     "authentication": {"max_rps": 0.05, "max_attempts": 5},
     "API": {"max_rps": 0.15, "max_attempts": 8},
@@ -66,6 +129,18 @@ def _apply_rate_caps(policy: Dict[str, Dict[str, float]], key: str, desired_rps:
     capped_rps = min(desired_rps, float(caps["max_rps"]))
     capped_attempts = min(desired_attempts, int(caps["max_attempts"]))
     return capped_rps, capped_attempts
+
+
+def _assert_within_caps(policy: Dict[str, Dict[str, float]], key: str, rps: float, attempts: int) -> None:
+    caps = policy.get(key)
+    if not caps:
+        return
+    max_rps = float(caps["max_rps"])
+    max_attempts = int(caps["max_attempts"])
+    if rps > (max_rps + 1e-9):
+        raise SystemExit(f"Safety abort: rps {rps} exceeds cap {max_rps} for {key}")
+    if attempts > max_attempts:
+        raise SystemExit(f"Safety abort: attempts {attempts} exceeds cap {max_attempts} for {key}")
 
 
 def _build_http_session(use_tor: bool, tor_proxy_url: str) -> requests.Session:
@@ -187,6 +262,7 @@ def render_markdown_report(report: Dict[str, Any]) -> str:
     ips = report.get("ips") or []
     tor = report.get("tor") or {}
     caps = report.get("rate_cap_policy") or {}
+    validation_graph = report.get("validation_graph") or []
     findings = report.get("findings") or []
     exposures = report.get("port_exposures") or []
 
@@ -234,6 +310,26 @@ def render_markdown_report(report: Dict[str, Any]) -> str:
         lines.append(_as_markdown_table(["IP", "Port", "Service", "Class"], exp_rows))
     else:
         lines.append("No exposures recorded.")
+    lines.append("")
+
+    lines.append("## CDN & Origin Exposure Analysis")
+    vg_rows: List[List[str]] = []
+    for host_item in validation_graph:
+        hn = str(host_item.get("hostname"))
+        for ip_item in host_item.get("resolved_ips") or []:
+            vg_rows.append(
+                [
+                    hn,
+                    str(ip_item.get("ip")),
+                    str(ip_item.get("type")),
+                    "yes" if ip_item.get("validated_tcp") else "no",
+                    "yes" if ip_item.get("validated_http") else "no",
+                ]
+            )
+    if vg_rows:
+        lines.append(_as_markdown_table(["Hostname", "IP", "Type", "TCP validated", "HTTP validated"], vg_rows))
+    else:
+        lines.append("No domain discovery data recorded.")
     lines.append("")
 
     lines.append("## Findings")
@@ -336,6 +432,70 @@ def resolve_ips(domain: str) -> Set[str]:
     except Exception:
         pass
     return ips
+
+
+def resolve_ips_all(domain: str) -> Tuple[Set[str], Set[str]]:
+    v4: Set[str] = set()
+    v6: Set[str] = set()
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(domain, None):
+            if family == socket.AF_INET:
+                v4.add(sockaddr[0])
+            elif family == socket.AF_INET6:
+                v6.add(sockaddr[0])
+    except Exception:
+        pass
+    return v4, v6
+
+
+def _reverse_dns(ip: str) -> str:
+    try:
+        host, _aliases, _ips = socket.gethostbyaddr(ip)
+        return str(host or "").lower()
+    except Exception:
+        return ""
+
+
+def classify_ip_fronting(ip: str) -> Tuple[str, Optional[str]]:
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return "origin", None
+
+    if isinstance(ip_obj, ipaddress.IPv4Address):
+        for provider, nets in CDN_IPV4_RANGES.items():
+            if any(ip_obj in n for n in nets):
+                return "cdn", provider
+
+    rdns = _reverse_dns(ip)
+    if any(x in rdns for x in ["cloudflare", "cdn.cloudflare"]):
+        return "cdn", "cloudflare"
+    if any(x in rdns for x in ["fastly", "fastlylb", "fastly.net"]):
+        return "cdn", "fastly"
+    if "cloudfront" in rdns or rdns.endswith(".cloudfront.net"):
+        return "cdn", "cloudfront"
+    if any(x in rdns for x in ["akamai", "edgesuite", "edgekey", "akamaitechnologies"]):
+        return "cdn", "akamai"
+
+    return "origin", None
+
+
+def hostname_candidates(target: str, root_domain: str) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    for h in [target, root_domain]:
+        if h and h not in seen:
+            out.append(h)
+            seen.add(h)
+
+    for sub in COMMON_SUBDOMAIN_CANDIDATES:
+        h = f"{sub}.{root_domain}" if root_domain else ""
+        if h and h not in seen:
+            out.append(h)
+            seen.add(h)
+
+    return out
 
 
 def safe_url(base: str, maybe_url: str) -> Optional[str]:
@@ -652,6 +812,9 @@ def validate_defense(
     errors: List[str] = []
     elapsed: List[float] = []
 
+    if any(str(k).lower() == "host" for k in headers.keys()):
+        raise SystemExit("Safety abort: Host header overrides are not permitted")
+
     if dry_run:
         return {
             "attempts": attempts,
@@ -742,6 +905,9 @@ You must have explicit permission from the system owner.
     if args.compliance and args.escalate != "yes":
         escalation_enabled = False
 
+    if args.compliance and escalation_enabled:
+        raise SystemExit("Safety abort: escalation is not permitted in compliance mode")
+
     endpoint_caps = COMPLIANCE_ENDPOINT_RATE_CAPS if args.compliance else ENDPOINT_RATE_CAPS
     port_caps = COMPLIANCE_PORT_RATE_CAPS if args.compliance else PORT_RATE_CAPS
 
@@ -758,32 +924,104 @@ You must have explicit permission from the system owner.
             log("[tor] Tor requested but exit IP could not be verified. Ensure Tor is running and requests has SOCKS support.")
             raise SystemExit(3)
 
-    ips: Set[str] = set()
-    if is_ip_literal(target):
-        ips.add(target)
-    else:
-        ips |= resolve_ips(target)
-    if not ips:
+    log("[phase] domain-discovery")
+    hostnames: List[str] = [target] if is_ip_literal(target) else hostname_candidates(target, root_domain)
+    validation_graph: Dict[str, Dict[str, Any]] = {}
+    hostname_to_ips: Dict[str, List[str]] = {}
+    hostname_cdn_detected: Dict[str, bool] = {}
+
+    for h in hostnames:
+        if is_ip_literal(h):
+            v4: Set[str] = {h}
+            v6: Set[str] = set()
+        else:
+            v4, v6 = resolve_ips_all(h)
+
+        resolved: List[Dict[str, Any]] = []
+        for ip in sorted(list(v4) + list(v6)):
+            t, provider = classify_ip_fronting(ip)
+            resolved.append(
+                {
+                    "ip": ip,
+                    "type": "cdn" if t == "cdn" else "origin",
+                    "cdn_provider": provider,
+                    "validated_tcp": False,
+                    "validated_http": False,
+                }
+            )
+
+        hostname_to_ips[h] = sorted(list(v4) + list(v6))
+        hostname_cdn_detected[h] = any(x.get("type") == "cdn" for x in resolved)
+        validation_graph[h] = {"hostname": h, "resolved_ips": resolved}
+
+        if resolved:
+            cdn_note = "cdn" if hostname_cdn_detected[h] else "origin"
+            log(f"[i] {h} -> {len(resolved)} IPs ({cdn_note})")
+        else:
+            log(f"[i] {h} -> no IPs")
+
+    primary_hostname = target if not is_ip_literal(target) else None
+    primary_v4: Set[str] = {target} if is_ip_literal(target) else resolve_ips(target)
+    if (not is_ip_literal(target)) and (not primary_v4):
         log("[-] Could not resolve any IPv4 addresses for target.")
         raise SystemExit(2)
 
-    log(f"[i] Discovered IPs: {', '.join(sorted(ips))}")
+    ips_to_scan_v4: Set[str] = set(primary_v4)
+    origin_candidates: List[Tuple[str, str]] = []
+    for h in hostnames:
+        for ip in hostname_to_ips.get(h, []):
+            t, _provider = classify_ip_fronting(ip)
+            if t != "cdn":
+                origin_candidates.append((h, ip))
+                try:
+                    if isinstance(ipaddress.ip_address(ip), ipaddress.IPv4Address):
+                        ips_to_scan_v4.add(ip)
+                except ValueError:
+                    pass
+
+    ip_scan_context: Dict[str, Dict[str, Any]] = {}
+    for ip in sorted(ips_to_scan_v4):
+        ip_scan_context[ip] = {
+            "hostname": primary_hostname or ip,
+            "ip": ip,
+            "cdn_detected": bool(primary_hostname and hostname_cdn_detected.get(primary_hostname, False)),
+            "origin_ip": False,
+            "bypasses_cdn": False,
+            "fallback_http_used": False,
+        }
+
+    for h, ip in origin_candidates:
+        if ip in ip_scan_context:
+            ip_scan_context[ip] = {
+                "hostname": h,
+                "ip": ip,
+                "cdn_detected": bool(hostname_cdn_detected.get(h, False)),
+                "origin_ip": True,
+                "bypasses_cdn": True,
+                "fallback_http_used": False,
+            }
+
+    log(f"[i] Discovered IPv4 targets (TCP scan): {', '.join(sorted(ips_to_scan_v4))}")
 
     exposures: List[PortExposure] = []
     endpoints: List[WebEndpoint] = []
     findings: List[Dict[str, Any]] = []
 
+    exposure_meta: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    base_url_meta: Dict[str, Dict[str, Any]] = {}
+
     protection_triggered_global = False
 
     log("[phase] discovery")
-    for ip in sorted(ips):
+    for ip in sorted(ips_to_scan_v4):
+        ctx = ip_scan_context.get(ip) or {"hostname": primary_hostname or ip, "ip": ip, "cdn_detected": False, "origin_ip": False, "bypasses_cdn": False, "fallback_http_used": False}
         log(f"[i] Scanning TCP ports 1-65535 on {ip} (connect scan)")
         if args.dry_run:
             continue
         ip_exposures = asyncio.run(
             discover_port_exposures(
                 ip=ip,
-                sni_host=target if not is_ip_literal(target) else None,
+                sni_host=str(ctx.get("hostname")) if not is_ip_literal(str(ctx.get("hostname"))) else None,
                 port_concurrency=args.port_concurrency,
                 port_timeout_s=args.port_timeout,
                 service_concurrency=min(300, max(1, args.port_concurrency // 2)),
@@ -792,6 +1030,14 @@ You must have explicit permission from the system owner.
         )
         exposures.extend(ip_exposures)
         log(f"[+] Open TCP ports on {ip}: {len(ip_exposures)}")
+
+        for e in ip_exposures:
+            exposure_meta[(e.ip, e.port)] = dict(ctx)
+        host_for_graph = str(ctx.get("hostname"))
+        if host_for_graph in validation_graph:
+            for item in validation_graph[host_for_graph].get("resolved_ips", []):
+                if item.get("ip") == ip:
+                    item["validated_tcp"] = True
 
     if args.tor and not args.dry_run:
         ok, resp = _tor_rotate_circuit(
@@ -822,10 +1068,98 @@ You must have explicit permission from the system owner.
     web_exposures = [e for e in exposures if e.exposure_class == "web"]
     base_url_ports: Dict[str, int] = {}
     log("[phase] validation")
+
+    web_exposures_primary = [e for e in web_exposures if e.ip in primary_v4]
+    cdn_detected_primary = bool(primary_hostname and hostname_cdn_detected.get(primary_hostname, False))
+
+    if (not is_ip_literal(target)) and cdn_detected_primary and (not web_exposures_primary):
+        log("[cdn] Detected CDN-fronted host — enabling HTTP fallback validation")
+        for scheme, port in [("http", 80), ("https", 443)]:
+            base_url = f"{scheme}://{target}"
+            base_url_ports[base_url] = port
+            base_url_meta[base_url] = {
+                "hostname": target,
+                "ip": sorted(primary_v4)[0] if primary_v4 else None,
+                "cdn_detected": True,
+                "fallback_http_used": True,
+                "origin_ip": False,
+                "bypasses_cdn": False,
+            }
+
+            start_url = f"{base_url}/"
+            log(f"[i] Web enumeration (fallback): {start_url}")
+            if args.dry_run:
+                discovered_urls = [start_url]
+            else:
+                discovered_urls = []
+                queue = [start_url]
+                seen: Set[str] = set()
+                while queue and len(discovered_urls) < args.web_max_pages:
+                    u = queue.pop(0)
+                    if u in seen:
+                        continue
+                    seen.add(u)
+                    try:
+                        t0 = time.monotonic()
+                        resp = session.get(u, timeout=args.web_timeout, allow_redirects=False)
+                        dt = time.monotonic() - t0
+                        discovered_urls.append(u)
+                        if resp.status_code in {403, 429}:
+                            protection_triggered_global = True
+                            if args.stop_on_trigger:
+                                break
+                        params = [k for k, _v in parse_qsl(urlsplit(u).query, keep_blank_values=True)]
+                        eclass = classify_endpoint(u, resp, dt)
+                        endpoints.append(WebEndpoint(base_url=base_url, url=u, endpoint_class=eclass, parameters=params))
+                        if scheme in {"http", "https"}:
+                            for item in validation_graph.get(target, {}).get("resolved_ips", []):
+                                item["validated_http"] = True
+                        ctype = (resp.headers.get("content-type") or "").lower()
+                        if "text/html" in ctype and resp.text:
+                            parser2 = _LinkExtractor()
+                            try:
+                                parser2.feed(resp.text)
+                            except Exception:
+                                pass
+                            for link in list(parser2.links)[:200]:
+                                su = safe_url(base_url, link)
+                                if not su:
+                                    continue
+                                if urlparse(su).netloc != urlparse(base_url).netloc:
+                                    continue
+                                queue.append(su)
+                    except requests.RequestException:
+                        discovered_urls.append(u)
+                    if protection_triggered_global and args.stop_on_trigger:
+                        break
+                for extra in ["/robots.txt", "/sitemap.xml", "/.well-known/security.txt"]:
+                    u = safe_url(base_url, extra)
+                    if u and u not in seen and len(discovered_urls) < args.web_max_pages:
+                        if not (protection_triggered_global and args.stop_on_trigger):
+                            discovered_urls.append(u)
+                            params = [k for k, _v in parse_qsl(urlsplit(u).query, keep_blank_values=True)]
+                            endpoints.append(
+                                WebEndpoint(base_url=base_url, url=u, endpoint_class=classify_endpoint(u, None, None), parameters=params)
+                            )
+
+            if protection_triggered_global and args.stop_on_trigger:
+                break
+
     for e in web_exposures:
+        ctx = exposure_meta.get((e.ip, e.port)) or ip_scan_context.get(e.ip) or {"hostname": primary_hostname or e.ip, "ip": e.ip, "cdn_detected": False, "origin_ip": False, "bypasses_cdn": False, "fallback_http_used": False}
         scheme = "https" if e.service == "https" else "http"
-        base_url = f"{scheme}://{target}:{e.port}" if (scheme == "http" and e.port != 80) or (scheme == "https" and e.port != 443) else f"{scheme}://{target}"
+        host_for_url = e.ip if bool(ctx.get("origin_ip")) else str(ctx.get("hostname"))
+        base_url = f"{scheme}://{host_for_url}:{e.port}" if (scheme == "http" and e.port != 80) or (scheme == "https" and e.port != 443) else f"{scheme}://{host_for_url}"
         base_url_ports[base_url] = e.port
+        if base_url not in base_url_meta:
+            base_url_meta[base_url] = {
+                "hostname": str(ctx.get("hostname")),
+                "ip": e.ip,
+                "cdn_detected": bool(ctx.get("cdn_detected")),
+                "fallback_http_used": bool(ctx.get("fallback_http_used")),
+                "origin_ip": bool(ctx.get("origin_ip")),
+                "bypasses_cdn": bool(ctx.get("bypasses_cdn")),
+            }
         start_url = f"{base_url}/"
 
         log(f"[i] Web enumeration: {start_url}")
@@ -855,6 +1189,12 @@ You must have explicit permission from the system owner.
                     params = [k for k, _v in parse_qsl(urlsplit(u).query, keep_blank_values=True)]
                     eclass = classify_endpoint(u, resp, dt)
                     endpoints.append(WebEndpoint(base_url=base_url, url=u, endpoint_class=eclass, parameters=params))
+
+                    host_for_graph = str(ctx.get("hostname"))
+                    if host_for_graph in validation_graph:
+                        for item in validation_graph[host_for_graph].get("resolved_ips", []):
+                            if item.get("ip") == e.ip:
+                                item["validated_http"] = True
 
                     ctype = (resp.headers.get("content-type") or "").lower()
                     if "text/html" in ctype and resp.text:
@@ -932,12 +1272,15 @@ You must have explicit permission from the system owner.
             if port_for_ep is None:
                 continue
 
+            meta = base_url_meta.get(ep.base_url) or {"hostname": target, "ip": None, "cdn_detected": False, "fallback_http_used": False, "origin_ip": False, "bypasses_cdn": False}
+
             if ep.endpoint_class == "authentication":
                 test = "repeated invalid credentials"
                 form_data = {"username": "invalid", "password": "invalid"}
                 desired_rps = max(0.2, args.rate)
                 desired_attempts = 30
                 eff_rps, eff_attempts = _apply_rate_caps(endpoint_caps, ep.endpoint_class, desired_rps, desired_attempts)
+                _assert_within_caps(endpoint_caps, ep.endpoint_class, eff_rps, eff_attempts)
                 result = validate_defense(
                     session=session,
                     url=ep.url,
@@ -955,6 +1298,7 @@ You must have explicit permission from the system owner.
                 desired_rps = max(0.5, args.rate)
                 desired_attempts = 25
                 eff_rps, eff_attempts = _apply_rate_caps(endpoint_caps, ep.endpoint_class, desired_rps, desired_attempts)
+                _assert_within_caps(endpoint_caps, ep.endpoint_class, eff_rps, eff_attempts)
                 result = validate_defense(
                     session=session,
                     url=ep.url,
@@ -981,6 +1325,13 @@ You must have explicit permission from the system owner.
                     "port": port_for_ep,
                     "exposure_class": "web",
                     "endpoint_class": ep.endpoint_class,
+                    "hostname": str(meta.get("hostname")),
+                    "hostname_used": str(meta.get("hostname")),
+                    "ip": meta.get("ip"),
+                    "cdn_detected": bool(meta.get("cdn_detected")),
+                    "fallback_http_used": bool(meta.get("fallback_http_used")),
+                    "origin_ip": bool(meta.get("origin_ip")),
+                    "bypasses_cdn": bool(meta.get("bypasses_cdn")),
                     "test_performed": test,
                     "expected_defense": expected,
                     "observed_behavior": observed,
@@ -997,10 +1348,12 @@ You must have explicit permission from the system owner.
 
     if escalation_enabled and (not protection_triggered_global or not args.stop_on_trigger):
         for e in [x for x in exposures if x.exposure_class != "web"]:
+            meta = exposure_meta.get((e.ip, e.port)) or ip_scan_context.get(e.ip) or {"hostname": target, "ip": e.ip, "cdn_detected": False, "fallback_http_used": False, "origin_ip": False, "bypasses_cdn": False}
             expected = "connection throttling, temporary blocks, or forced disconnects"
             desired_rps = max(0.5, args.rate)
             desired_attempts = 30
             eff_rps, eff_attempts = _apply_rate_caps(port_caps, e.exposure_class, desired_rps, desired_attempts)
+            _assert_within_caps(port_caps, e.exposure_class, eff_rps, eff_attempts)
             result = validate_port_protection(
                 ip=e.ip,
                 port=e.port,
@@ -1023,6 +1376,13 @@ You must have explicit permission from the system owner.
                     "port": e.port,
                     "exposure_class": e.exposure_class,
                     "endpoint_class": None,
+                    "hostname": str(meta.get("hostname")),
+                    "hostname_used": str(meta.get("hostname")),
+                    "ip": meta.get("ip"),
+                    "cdn_detected": bool(meta.get("cdn_detected")),
+                    "fallback_http_used": bool(meta.get("fallback_http_used")),
+                    "origin_ip": bool(meta.get("origin_ip")),
+                    "bypasses_cdn": bool(meta.get("bypasses_cdn")),
                     "test_performed": "repeated TCP connections",
                     "expected_defense": expected,
                     "observed_behavior": observed,
@@ -1060,9 +1420,11 @@ You must have explicit permission from the system owner.
     }
 
     output = {
+        "release": "Defensive Validation — CDN-Aware",
         "target": target,
         "root_domain": root_domain,
-        "ips": sorted(ips),
+        "ips": sorted(list(ips_to_scan_v4)),
+        "validation_graph": [validation_graph[h] for h in hostnames if h in validation_graph],
         "tor": {
             "enabled": bool(args.tor),
             "proxy": args.tor_proxy if args.tor else None,
